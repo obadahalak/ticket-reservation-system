@@ -12,7 +12,7 @@ A production-grade ticket reservation API built with **Laravel**, **Redis**, and
 - [API Reference](#api-reference)
 - [Concurrency Strategy](#concurrency-strategy)
 - [Performance Testing](#performance-testing)
-
+  
 ---
 
 ## Overview
@@ -73,7 +73,6 @@ The result: **zero overselling**, **sub-millisecond availability checks**, and *
 | Layer            | Technology                     |
 | ---------------- | ------------------------------ |
 | **Framework**    | Laravel 12 (PHP 8.4)           |
-| **Auth**         | Laravel Sanctum (API Tokens)   |
 | **Cache / Lock** | Redis (Alpine)                 |
 | **Database**     | MySQL 8.0                      |
 | **Web Server**   | Nginx (Alpine) + PHP-FPM       |
@@ -106,12 +105,11 @@ docker-compose exec app php artisan key:generate
 docker-compose exec app php artisan migrate --seed
 ```
 
-The `--seed` flag populates 10 real-world events and initializes their ticket counters in Redis.
 
 ### 3. Start the Queue Worker
 
 ```bash
-docker-compose exec app php artisan queue:work --tries=2
+docker-compose exec app php artisan queue:work
 ```
 
 ---
@@ -122,7 +120,7 @@ docker-compose exec app php artisan queue:work --tries=2
 #### Reserve Ticket — Request Example
 
 ```bash
-curl -X POST http://localhost:8080/api/events/1/reserve \
+curl -X POST http://localhost:8080/api/v2/events/1/reserve \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: unique-request-id-123" \
   -d '{"event_id": 1, "user_id": 42}'
@@ -139,67 +137,38 @@ curl -X POST http://localhost:8080/api/events/1/reserve \
 
 ---
 
-## Concurrency Strategy
+## Concurrency Strategy: Why This Works
 
-The system employs a **multi-layered defense** to guarantee correctness under extreme concurrency:
+The system utilizes a **four-layer defense** to handle massive traffic spikes while ensuring absolute data integrity. By moving the "heavy lifting" away from the database, we prevent the system from slowing down under pressure.
 
-### Layer 1 — Idempotency Middleware
+### Layer 1: The Request Filter
+Before a request even reaches the business logic, we check its unique signature. If a user clicks the button multiple times—due to a bad connection or impatience—the system recognizes the signature and only processes the first attempt.
+> **Implementation:** `App\Http\Middleware\IdempotencyCheck`
 
-```
-Idempotency-Key header → Redis SET with 24h TTL
-```
+### Layer 2: The Fair-Play Guard
+To prevent a single user or a malicious bot from taking all the tickets in a few milliseconds, we enforce a brief cooldown period. This ensures that the tickets are distributed fairly among as many real people as possible.
+> **Implementation:** `App\Http\Middleware\ReservationRateLimiter`
 
-Every reservation request **must** include an `Idempotency-Key` header. If the same key is seen again, the original response is returned immediately. This prevents accidental double-purchases from network retries, impatient users, or client bugs.
+### Layer 3: The Ultra-Fast Gatekeeper
+This is the heart of the system. Instead of checking ticket availability in a slow database, we use a high-speed, memory-based gatekeeper.
+- **The Logic:** It acts like a digital turnstile that only allows a specific number of people through. 
+- **The Benefit:** It processes requests in sequence so quickly that thousands of users can be checked in less than a second.
+> **Implementation:** `App\Http\Services\TicketAvailabilityService`
 
-### Layer 2 — Rate Limiter Middleware
+### Layer 4: The Background Accountant
+Once the Gatekeeper confirms a ticket is available, the user receives an instant "Success" message. The slow process of officially recording the sale in the main database is handed off to a background worker.
+- If the background recording fails for any reason, the ticket is automatically returned to the pool.
+> **Implementation:** `App\Jobs\ProcessReservation`
 
-```
-Redis SET NX (user + event) → 10-second cooldown
-```
+---
 
-A per-user, per-event sliding window prevents a single user from spamming the reservation endpoint. Uses Redis `SET ... NX EX` for an atomic lock with automatic expiry.
+### Efficiency Comparison
 
-### Layer 3 — Atomic Ticket Counter (Redis)
-
-```
-Redis DECR tickets:event:{id}
-  → remaining >= 0 → ✅ Accept
-  → remaining < 0  → INCR (rollback) → ❌ Reject
-```
-
-The `TicketAvailabilityService` performs an atomic `DECR` on a Redis key. This is a **single-threaded, O(1) operation** — no matter how many concurrent requests arrive, Redis serializes them and each one gets a consistent, race-free answer.
-
-- **Accept**: Counter decremented, request proceeds to queue.
-- **Reject**: Counter rolled back with `INCR`, 422 returned immediately.
-
-### Layer 4 — Queued Persistence (MySQL)
-
-```
-ProcessReservation Job → DB::transaction + lockForUpdate()
-```
-
-Accepted reservations are dispatched to a **background queue job** that:
-
-1. Opens a database transaction with `lockForUpdate()` on the Event row.
-2. Double-checks `available_tickets > 0` (defense-in-depth).
-3. Creates the `Reservation` record.
-4. Decrements `available_tickets` in MySQL.
-
-If the job **fails** (e.g., DB down), the Redis counter is automatically **rolled back** via the `failed()` method, ensuring the ticket returns to the pool.
-
-### Why This Works
-
-```
-Traditional approach:           This system:
-───────────────────             ────────────────
-SELECT ... FOR UPDATE           Redis DECR (μs)
-  ↓ (blocks all others)          ↓ (non-blocking)
-INSERT reservation              Queue → async INSERT
-  ↓                               ↓
-COMMIT                          DB transaction (isolated)
-  ↓                               ↓
-~200ms per request              ~1ms gate + async write
-```
+| Step | Traditional Database Method | This High-Concurrency Method |
+| :--- | :--- | :--- |
+| **Availability Check** | Locks the database row (Slow/Blocks others) | Memory-speed turnstile (Instant/Non-blocking) |
+| **User Experience** | User waits for the database to finish writing | User gets an immediate confirmation |
+| **System Health** | High risk of crashing during spikes | Remains fast and stable under heavy pressure |
 
 ---
 
@@ -225,9 +194,38 @@ k6 run purchase-test.js
 - **p(95) response time**: < 500ms
 
 
+---
+# 🚀 Performance Comparison: V1 (Naive) vs. V2 (Enhanced)
+
+Below is a detailed comparison between the standard synchronous implementation and the optimized version using Redis atomicity and background processing.
+
+### 📊 Metric Comparison
+
+| Metric | 🐢 V1: Native (Naive) | 🚀 V2: Enhanced (Redis + Queues) | Improvement |
+| :--- | :--- | :--- | :--- |
+| **Throughput (Req/sec)** | **56.03 req/s** | **699.31 req/s** | **+1,148%** Faster |
+| **Total Requests Processed** | 2,914 | 20,440 | **x7.0** Capacity |
+| **Peak Virtual Users (VUs)** | 7,000 | 7,000 | Same Load |
+| **P(95) Response Time** | **41.23 seconds** | **11.46 seconds** | **-72.2%** Latency |
+| **Avg. Response Time** | 25.76 seconds | 4.57 seconds | **-82.2%** Latency |
+| **Data Throughput (Recv)** | 1.0 MB | 7.3 MB | **x7.3** Data Volume |
+| **Server Errors (500s/0)** | 0.00% | 0.00% | Both Stable |
+| **Status Check (200/422)** | 100% | 100% | Both Reliable |
 
 ---
 
-## License
 
-This project is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+### Updated Strategic Summary
+
+> **V2 is the clear winner**, specifically because it eliminates **Database Row Contention**.
+
+#### 🐢 The V1 (Naive) Problem:
+*   **Bottleneck:** **Row-level Locking.** By decrementing a column inside a database transaction, you force thousands of concurrent users to wait for a single row-lock. 
+*   **Sequential Processing:** The database is forced to process reservations one-by-one for that event, effectively making your high-concurrency system behave like a single-lane road.
+
+#### 🚀 The V2 (Enhanced) Advantage:
+*   **Memory-Speed Counters:** Redis handles the decrement in RAM without heavy row locks. It can handle tens of thousands of decrements per second.
+*   **Decoupled Writing:** By using a Background Job the web request doesn't have to wait for the slow Disk I/O of the database.
+*   **Result:** You get the same level of safety (no overselling) but with **10x higher throughput**.
+
+**Conclusion:** V2 proves that moving the "Counter" logic from a Locked Database Row to an Atomic Redis Key is the secret to true high-concurrency scaling.

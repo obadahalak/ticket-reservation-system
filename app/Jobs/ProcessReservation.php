@@ -4,13 +4,12 @@ namespace App\Jobs;
 
 use App\Models\Reservation;
 use App\Models\Event;
-use DB;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
-use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Redis;
 
 class ProcessReservation implements ShouldQueue
@@ -47,8 +46,6 @@ class ProcessReservation implements ShouldQueue
                 'event_id' => $this->eventId,
             ]);
             $event->decrement('available_tickets', 1);
-
-
         });
     }
     public function failed($exception)
